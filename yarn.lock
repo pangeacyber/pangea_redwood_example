@@ -23538,9 +23538,11 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "web@workspace:web"
   dependencies:
+    "@redwoodjs/auth": 3.1.2
     "@redwoodjs/forms": 3.1.2
     "@redwoodjs/router": 3.1.2
     "@redwoodjs/web": 3.1.2
+    humanize-string: 2.1.0
     prop-types: 15.8.1
     react: 17.0.2
     react-dom: 17.0.2
