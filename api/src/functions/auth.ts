@@ -1,16 +1,46 @@
-import type { APIGatewayProxyEvent, Context } from 'aws-lambda'
+import { Address4 } from 'ip-address'
 
 import { DbAuthHandler } from '@redwoodjs/api'
-import type { DbAuthHandlerOptions } from '@redwoodjs/api'
 
 import { db } from 'src/lib/db'
+import { audit, embargo } from 'src/lib/pangea'
 
-export const handler = async (
-  event: APIGatewayProxyEvent,
-  context: Context
-) => {
+export const handler = async (event, context) => {
+  const ipAddress = ({ event }) => {
+    return (
+      event?.headers?.['client-ip'] ||
+      event?.requestContext?.identity?.sourceIp ||
+      'localhost' //'210.52.109.1'
+    )
+  }
 
-  const forgotPasswordOptions: DbAuthHandlerOptions['forgotPassword'] = {
+  const checkIpAddress = async (): Promise<{
+    found: number
+    clientIp: string
+    country: string
+    countryCode: string
+  }> => {
+    let found = 0
+    let country = undefined
+    let countryCode = undefined
+    const clientIp = ipAddress(event)
+    if (Address4.isValid(clientIp)) {
+      const embargoResp = await embargo.ipCheck(ipAddress(event))
+      found = embargoResp.result.count
+      if (embargoResp.result.count > 0) {
+        country = embargoResp.result.sanctions[0].embargoed_country_name
+        countryCode = embargoResp.result.sanctions[0].embargoed_country_iso_code
+      }
+    }
+    return {
+      found: found,
+      clientIp: clientIp,
+      country: country,
+      countryCode: countryCode,
+    }
+  }
+
+  const forgotPasswordOptions = {
     // handler() is invoked after verifying that a user was found with the given
     // username. This is where you can send the user an email with a link to
     // reset their password. With the default dbAuth routes and field names, the
@@ -24,6 +54,7 @@ export const handler = async (
     // address in a toast message so the user will know it worked and where
     // to look for the email.
     handler: (user) => {
+      throw Error(`${user.resetToken}`)
       return user
     },
 
@@ -40,7 +71,7 @@ export const handler = async (
     },
   }
 
-  const loginOptions: DbAuthHandlerOptions['login'] = {
+  const loginOptions = {
     // handler() is called after finding the user that matches the
     // username/password provided at login, but before actually considering them
     // logged in. The `user` argument will be the user in the database that
@@ -52,7 +83,29 @@ export const handler = async (
     // didn't validate their email yet), throw an error and it will be returned
     // by the `logIn()` function from `useAuth()` in the form of:
     // `{ message: 'Error message' }`
-    handler: (user) => {
+    handler: async (user) => {
+      const ipResults = await checkIpAddress()
+      if (ipResults.found > 0) {
+        audit.log({
+          actor: user.email,
+          action: 'Login',
+          status: 'Success',
+          source: `${ipResults.clientIp}`,
+          message: `${user.email} is attempting to log in from an embargoed country - ${ipResults.country} (${ipResults.countryCode})`,
+        })
+        throw new Error(
+          `Access Denied. You are attempting to log in from an embargoed country - ${ipResults.country} (${ipResults.countryCode})`
+        )
+      } else {
+        audit.log({
+          actor: user.email,
+          action: 'Login',
+          status: 'Success',
+          source: `${ipResults.clientIp}`,
+          message: `${user.email} succesfully logged in.`,
+        })
+        return user
+      }
       return user
     },
 
@@ -69,13 +122,20 @@ export const handler = async (
     expires: 60 * 60 * 24 * 365 * 10,
   }
 
-  const resetPasswordOptions: DbAuthHandlerOptions['resetPassword'] = {
+  const resetPasswordOptions = {
     // handler() is invoked after the password has been successfully updated in
     // the database. Returning anything truthy will automatically log the user
     // in. Return `false` otherwise, and in the Reset Password page redirect the
     // user to the login page.
-    handler: (_user) => {
-      return true
+    handler: (user) => {
+      audit.log({
+        actor: user.email,
+        action: 'Password Reset',
+        status: 'Success',
+        source: `${ipAddress(event)}`,
+        message: `${user.email} performed a password reset.`,
+      })
+      return user
     },
 
     // If `false` then the new password MUST be different from the current one
@@ -93,7 +153,7 @@ export const handler = async (
     },
   }
 
-  const signupOptions: DbAuthHandlerOptions['signup'] = {
+  const signupOptions = {
     // Whatever you want to happen to your data on new user signup. Redwood will
     // check for duplicate usernames before calling this handler. At a minimum
     // you need to save the `username`, `hashedPassword` and `salt` to your
@@ -109,7 +169,27 @@ export const handler = async (
     //
     // If this returns anything else, it will be returned by the
     // `signUp()` function in the form of: `{ message: 'String here' }`.
-    handler: ({ username, hashedPassword, salt, userAttributes }) => {
+    handler: async ({ username, hashedPassword, salt, userAttributes }) => {
+      const ipResults = await checkIpAddress()
+      if (ipResults.found > 0) {
+        audit.log({
+          action: 'Create Account',
+          status: 'Failed',
+          source: `${ipResults.clientIp}`,
+          message: `${ipResults.clientIp} is attempting to create an account (${username}) from an embargoed country - ${ipResults.country} (${ipResults.countryCode})`,
+        })
+        throw new Error(
+          `Access Denied. You are attempting to create an account from an embargoed country - ${ipResults.country} (${ipResults.countryCode})`
+        )
+      } else {
+        audit.log({
+          actor: username,
+          action: 'Create Account',
+          status: 'Success',
+          source: `${ipResults.clientIp}`,
+          message: `An account (${username}) was created from ${ipResults.clientIp}`,
+        })
+      }
       return db.user.create({
         data: {
           email: username,
